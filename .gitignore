@@ -1,0 +1,25 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+venv/
+ENV/
+.env
+
+# PyCharm / JetBrains files
+.idea/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+/my_data/facebook_chat/*
+!/my_data/facebook_chat/.gitkeep
+
+model/
+
+RAG/
