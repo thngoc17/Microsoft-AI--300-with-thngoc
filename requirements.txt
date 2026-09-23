@@ -1,0 +1,29 @@
+# ==========================================================================
+# Tổng hợp từ import THẬT trong repo — không liệt kê package chưa dùng đến.
+# ==========================================================================
+
+# ---- Xác thực & cấu hình (dùng ở mọi file: chunking.py, create-index.py,
+#      rag-pipeline.py, src/agent/config.py, evals/run_eval.py) ----
+azure-identity>=1.19.0
+python-dotenv>=1.0.1
+
+# ---- Azure AI Search — control plane + data plane
+#      (chunking.py, create-index.py, rag-pipeline.py) ----
+azure-search-documents>=11.6.0
+
+# ---- Foundry Agent SDK (src/agent/core.py, src/agent/tools/search_tool.py)
+#      Pin ĐÚNG version evals/run_eval.py đã khai trong docstring, để agent
+#      runtime và eval runner luôn chạy cùng 1 SDK version trong cùng 1 CI
+#      run — tránh lệch behaviour giữa 2 job. ----
+azure-ai-projects==2.7.0
+
+# ---- Guardrails (src/agent/guardrails.py) ----
+azure-ai-contentsafety>=1.0.0
+
+# ---- Generation / Embedding client
+#      (rag-pipeline.py dùng OpenAI SDK gọi cả AzureOpenAI lẫn endpoint
+#      DeepSeek qua Serverless MaaS tương thích OpenAI) ----
+openai>=1.55.0
+
+# ---- Chunking — đọc YAML frontmatter trong file Markdown (chunking.py) ----
+PyYAML>=6.0.2

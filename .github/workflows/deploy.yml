@@ -7,15 +7,26 @@ on:
 
 env:
   RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP || 'foundry-agent-rg' }}
-  INDEX_NAME: "enterprise-knowledge-index"
-  AGENT_NAME: "support-agent"
+  # Các giá trị dưới đây PHẢI khớp chính xác với default trong
+  # src/agent/config.py và docstring của evals/run_eval.py — không đổi ở
+  # đây mà không đổi cả 2 chỗ kia.
+  AZURE_SEARCH_INDEX_NAME: "ai300-notes-index"
+  AZURE_SEARCH_CONNECTION_NAME: "SearchServiceConnection"
+  FOUNDRY_AGENT_NAME: "support-agent"
+  GOLDEN_DATASET: "evals/test_dataset.jsonl"
 
 jobs:
   # =========================================================================
-  # JOB 1: Đảm bảo toàn bộ hạ tầng (Hub, Project, Search, AOAI) đã sẵn sàng
+  # JOB 1: Đảm bảo hạ tầng Foundry (account + project MỚI), Search, Model
+  #        deployment đã sẵn sàng — và XUẤT output để Job 2 dùng trực tiếp,
+  #        thay vì dò lại resource bằng CLI (fragile, dễ lệch khi đổi tên).
   # =========================================================================
   ensure-infra:
     runs-on: ubuntu-latest
+    outputs:
+      foundry_project_endpoint: ${{ steps.bicep-deploy.outputs.foundry_project_endpoint }}
+      agent_model_deployment_name: ${{ steps.bicep-deploy.outputs.agent_model_deployment_name }}
+      search_service_name: ${{ steps.bicep-deploy.outputs.search_service_name }}
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v4
@@ -29,17 +40,38 @@ jobs:
         id: bicep-deploy
         run: |
           echo "Đang kiểm tra và cập nhật hạ tầng tại Resource Group: ${{ env.RESOURCE_GROUP }}..."
-          az deployment group create \
+          DEPLOY_OUTPUT=$(az deployment group create \
             --resource-group ${{ env.RESOURCE_GROUP }} \
             --template-file infra/main.bicep \
-            --output none
+            --query properties.outputs \
+            --output json)
+
+          echo "foundry_project_endpoint=$(echo "$DEPLOY_OUTPUT" | jq -r '.foundryProjectEndpoint.value')" >> "$GITHUB_OUTPUT"
+          echo "agent_model_deployment_name=$(echo "$DEPLOY_OUTPUT" | jq -r '.agentModelDeploymentName.value')" >> "$GITHUB_OUTPUT"
+          echo "search_service_name=$(echo "$DEPLOY_OUTPUT" | jq -r '.searchServiceName.value')" >> "$GITHUB_OUTPUT"
 
   # =========================================================================
-  # JOB 2: Cập nhật Schema Index, Build Agent, Chạy Eval và Smoke Test
+  # JOB 2: Sync Index schema, Sync Agent definition, chạy Eval Quality Gate,
+  #        Smoke Test — theo đúng thứ tự phụ thuộc (Agent cần Index đã tồn
+  #        tại trước khi gắn tool; Eval cần Agent đã tồn tại trước khi test).
   # =========================================================================
   deploy-eval-and-smoke-test:
     needs: ensure-infra
     runs-on: ubuntu-latest
+    env:
+      # Các biến này CHỈ biết được sau khi Job 1 deploy xong — không đưa
+      # được lên env cấp workflow.
+      FOUNDRY_PROJECT_ENDPOINT: ${{ needs.ensure-infra.outputs.foundry_project_endpoint }}
+      FOUNDRY_AGENT_MODEL_DEPLOYMENT: ${{ needs.ensure-infra.outputs.agent_model_deployment_name }}
+      # Dùng lại CHÍNH model của Agent để làm judge cho evaluator. Đây là
+      # lựa chọn tối giản, KHÔNG phải best practice — dùng cùng 1 model vừa
+      # sinh câu trả lời vừa chấm điểm câu trả lời của chính nó có thể làm
+      # lệch (bias) kết quả eval. Nếu muốn đúng chuẩn, thêm 1
+      # Microsoft.CognitiveServices/accounts/deployments riêng trong
+      # main.bicep cho model judge (vd. một bản rẻ/nhanh hơn) rồi trỏ biến
+      # này sang deployment đó thay vì dùng chung agent_model_deployment_name.
+      FOUNDRY_JUDGE_DEPLOYMENT: ${{ needs.ensure-infra.outputs.agent_model_deployment_name }}
+      AZURE_SEARCH_ENDPOINT: https://${{ needs.ensure-infra.outputs.search_service_name }}.search.windows.net
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v4
@@ -56,72 +88,55 @@ jobs:
           cache: 'pip'
 
       - name: Install Dependencies
-        run: |
-          pip install -r requirements.txt
-          az extension add -n ml -y
+        run: pip install -r requirements.txt
 
-      # Dò tìm tự động tài nguyên từ Resource Group (Dynamic Discovery Pattern)
-      - name: Discover Resources in Resource Group
-        id: discovery
-        run: |
-          echo "Dò tìm Foundry Project..."
-          PROJECT_NAME=$(az ml workspace list -g ${{ env.RESOURCE_GROUP }} --query "[?kind=='Project'].name | [0]" -o tsv)
-          if [ -z "$PROJECT_NAME" ]; then
-            echo "::error::Không tìm thấy Foundry Project trong ${{ env.RESOURCE_GROUP }}."
-            exit 1
-          fi
-          echo "FOUNDRY_PROJECT=$PROJECT_NAME" >> "$GITHUB_ENV"
-
-          echo "Dò tìm Azure AI Search..."
-          SEARCH_NAME=$(az search service list -g ${{ env.RESOURCE_GROUP }} --query "[0].name" -o tsv)
-          echo "SEARCH_SERVICE_NAME=$SEARCH_NAME" >> "$GITHUB_ENV"
-
-          echo "Found Project: $PROJECT_NAME, Search: $SEARCH_NAME"
-
-      # Idempotent Index Sync: Kiểm tra Search Index đã tồn tại chưa
+      # Idempotent Index Sync: gọi THẲNG create-index.py — đây là nguồn xác
+      # thực (source of truth) duy nhất của schema, tự xoá/tạo lại index
+      # sạch mỗi lần chạy. Không dùng file JSON schema rời (infra/
+      # search_index_schema.json) vì file đó không tồn tại và sẽ dễ lệch
+      # với schema thật trong create-index.py theo thời gian.
       - name: Create or Update Azure AI Search Index (Idempotent)
-        run: |
-          INDEX_EXISTS=$(az search index list --service-name ${{ env.SEARCH_SERVICE_NAME }} -g ${{ env.RESOURCE_GROUP }} --query "[?name=='${{ env.INDEX_NAME }}'].name" -o tsv || true)
+        run: python src/create-index.py
 
-          if [ -n "$INDEX_EXISTS" ]; then
-            echo "Index ${{ env.INDEX_NAME }} đã tồn tại. Bỏ qua tạo mới (hoặc dùng PUT để update schema)."
-          else
-            echo "Index chưa tồn tại. Khởi tạo Index theo schema..."
-            az search index create \
-              --service-name ${{ env.SEARCH_SERVICE_NAME }} \
-              --resource-group ${{ env.RESOURCE_GROUP }} \
-              --index-file-path infra/search_index_schema.json
-          fi
-
-      # Cập nhật Agent Definition bằng Foundry SDK
-      - name: Sync Agent Code & Prompts
+      # Đăng ký / nâng version Agent bằng chính src/agent/core.py — không
+      # còn đoạn python -c gọi from_connection_string đã bị SDK loại bỏ.
+      - name: Sync Agent Definition (Prompt Agent) lên Foundry
         run: |
           python -c "
-          import os
-          from azure.identity import DefaultAzureCredential
-          from azure.ai.projects import AIProjectClient
-          from azure.ai.projects.models import AzureAISearchTool
+          from src.agent.core import FoundryRagAgent
 
-          # Lấy chuỗi kết nối Foundry Project từ CLI context
-          client = AIProjectClient.from_connection_string(
-              credential=DefaultAzureCredential(),
-              conn_str=os.environ.get('FOUNDRY_PROJECT_CONNECTION_STRING', '')
-          )
-          print('Đã kết nối Foundry Project, đồng bộ hóa Agent...')
+          agent = FoundryRagAgent()
+          agent.create_or_update()
           "
 
-      # Quality Gate: Chạy đánh giá định lượng bằng azure-ai-evaluation
+      # Quality Gate: Chạy đánh giá định lượng bằng azure-ai-evaluation.
+      # Toàn bộ biến FOUNDRY_PROJECT_ENDPOINT / FOUNDRY_AGENT_NAME /
+      # FOUNDRY_JUDGE_DEPLOYMENT / GOLDEN_DATASET đã được set ở trên —
+      # run_eval.py sẽ tự exit 1 nếu bất kỳ threshold nào trong
+      # evals/threshold.json không đạt.
       - name: Run Automated Evaluation Quality Gate
-        run: |
-          echo "Chạy bộ đánh giá Eval-as-Code..."
-          python evals/run_eval.py
+        run: python evals/run_eval.py
 
-      # Kiểm thử nhanh Agent (Smoke Test)
+      # Smoke Test — gọi Agent THẬT qua 1 câu hỏi mẫu, fail job nếu câu trả
+      # lời rỗng hoặc bị guardrails chặn (khác bản cũ chỉ print() cố định,
+      # không bao giờ fail).
       - name: Smoke Test Agent Execution
         run: |
-          echo "Gửi request kiểm tra thực tế tới Agent..."
           python -c "
           import sys
-          # Test script gọi nhanh 1 câu hỏi mẫu đến agent
-          print('Agent phản hồi thành công và vượt qua kiểm tra Guardrails!')
+          from src.agent.core import FoundryRagAgent
+
+          agent = FoundryRagAgent()
+          result = agent.ask('RBAC là gì? Sự khác nhau giữa Control Plane và Data Plane?')
+
+          if not result['answer'].strip():
+              print('::error::Agent trả về câu trả lời rỗng.')
+              sys.exit(1)
+
+          if 'guardrails' in result['answer'].lower():
+              print('::error::Smoke test bị chặn bởi Content Safety guardrails.')
+              sys.exit(1)
+
+          print('Agent phản hồi thành công, vượt qua Smoke Test:')
+          print(result['answer'][:300])
           "
