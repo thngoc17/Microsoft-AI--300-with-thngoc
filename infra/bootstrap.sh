@@ -7,9 +7,9 @@
 # =============================================================================
 set -euo pipefail
 
-SUBSCRIPTION_ID="<SUBSCRIPTION_ID_CUA_BAN>"
+SUBSCRIPTION_ID="f6b812fd-ef94-4ce1-948f-ea652339a497"
 RESOURCE_GROUP="foundry-agent-rg"         # Khớp với GitHub repo Variable "RESOURCE_GROUP"
-LOCATION="eastasia"
+LOCATION="japaneast"
 SP_NAME="sp-foundry-agent-cicd"
 
 echo "==> Đăng nhập và chọn đúng subscription..."

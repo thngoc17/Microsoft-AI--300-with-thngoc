@@ -1,0 +1,24 @@
+{
+  "relevance": {
+    "threshold": 5
+  },
+  "groundedness": {
+    "threshold": 5
+  },
+  "coherence": {
+    "threshold": 5
+  },
+  "fluency": {
+    "threshold": 5
+  },
+  "similarity": {
+    "threshold": 5
+  },
+  "response_completeness": {
+    "threshold": 5
+  },
+  "quality_grader": {
+    "threshold": null,
+    "use_service_default": true
+  }
+}
