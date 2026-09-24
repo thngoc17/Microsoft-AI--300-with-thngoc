@@ -1,32 +1,29 @@
-name: Foundry LLMOps Pipeline - Agent & Search
+name: Deploy Qwen Azure ML Endpoint
 
 on:
   push:
     tags:
-      - 'v*.*.*' # Chạy khi gắn release tag chuẩn git (vd: v1.0.0)
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qwen-deploy-${{ vars.RESOURCE_GROUP || 'digital-twin-rg' }}
+  cancel-in-progress: false
 
 env:
-  RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP || 'foundry-agent-rg' }}
-  # Các giá trị dưới đây PHẢI khớp chính xác với default trong
-  # src/agent/config.py và docstring của evals/run_eval.py — không đổi ở
-  # đây mà không đổi cả 2 chỗ kia.
-  AZURE_SEARCH_INDEX_NAME: "ai300-notes-index"
-  AZURE_SEARCH_CONNECTION_NAME: "SearchServiceConnection"
-  FOUNDRY_AGENT_NAME: "support-agent"
-  GOLDEN_DATASET: "evals/test_dataset.jsonl"
+  WORKSPACE: ${{ vars.WORKSPACE || 'qwen-twin-workspace' }}
+  RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP || 'digital-twin-rg' }}
+  IMAGE_NAME: qwen-rag-api
+  ENDPOINT_NAME: qwen-rag-endpoint-ver1
+  DEPLOYMENT_NAME: rag-deployment-ver1
+  IMAGE_TAG: v1.${{ github.run_number }}
 
 jobs:
-  # =========================================================================
-  # JOB 1: Đảm bảo hạ tầng Foundry (account + project MỚI), Search, Model
-  #        deployment đã sẵn sàng — và XUẤT output để Job 2 dùng trực tiếp,
-  #        thay vì dò lại resource bằng CLI (fragile, dễ lệch khi đổi tên).
-  # =========================================================================
-  ensure-infra:
+  build-register-deploy:
     runs-on: ubuntu-latest
-    outputs:
-      foundry_project_endpoint: ${{ steps.bicep-deploy.outputs.foundry_project_endpoint }}
-      agent_model_deployment_name: ${{ steps.bicep-deploy.outputs.agent_model_deployment_name }}
-      search_service_name: ${{ steps.bicep-deploy.outputs.search_service_name }}
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v4
@@ -36,107 +33,132 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Deploy Infrastructure via Bicep
-        id: bicep-deploy
+      - name: Install Azure ML Extension
+        shell: bash
+        run: az extension add -n ml -y
+
+      - name: Set Default Azure ML Workspace
+        shell: bash
         run: |
-          echo "Đang kiểm tra và cập nhật hạ tầng tại Resource Group: ${{ env.RESOURCE_GROUP }}..."
-          DEPLOY_OUTPUT=$(az deployment group create \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --template-file infra/main.bicep \
-            --query properties.outputs \
-            --output json)
+          set -euo pipefail
+          az configure --defaults \
+            workspace="$WORKSPACE" \
+            group="$RESOURCE_GROUP"
 
-          echo "foundry_project_endpoint=$(echo "$DEPLOY_OUTPUT" | jq -r '.foundryProjectEndpoint.value')" >> "$GITHUB_OUTPUT"
-          echo "agent_model_deployment_name=$(echo "$DEPLOY_OUTPUT" | jq -r '.agentModelDeploymentName.value')" >> "$GITHUB_OUTPUT"
-          echo "search_service_name=$(echo "$DEPLOY_OUTPUT" | jq -r '.searchServiceName.value')" >> "$GITHUB_OUTPUT"
-
-  # =========================================================================
-  # JOB 2: Sync Index schema, Sync Agent definition, chạy Eval Quality Gate,
-  #        Smoke Test — theo đúng thứ tự phụ thuộc (Agent cần Index đã tồn
-  #        tại trước khi gắn tool; Eval cần Agent đã tồn tại trước khi test).
-  # =========================================================================
-  deploy-eval-and-smoke-test:
-    needs: ensure-infra
-    runs-on: ubuntu-latest
-    env:
-      # Các biến này CHỈ biết được sau khi Job 1 deploy xong — không đưa
-      # được lên env cấp workflow.
-      FOUNDRY_PROJECT_ENDPOINT: ${{ needs.ensure-infra.outputs.foundry_project_endpoint }}
-      FOUNDRY_AGENT_MODEL_DEPLOYMENT: ${{ needs.ensure-infra.outputs.agent_model_deployment_name }}
-      # Dùng lại CHÍNH model của Agent để làm judge cho evaluator. Đây là
-      # lựa chọn tối giản, KHÔNG phải best practice — dùng cùng 1 model vừa
-      # sinh câu trả lời vừa chấm điểm câu trả lời của chính nó có thể làm
-      # lệch (bias) kết quả eval. Nếu muốn đúng chuẩn, thêm 1
-      # Microsoft.CognitiveServices/accounts/deployments riêng trong
-      # main.bicep cho model judge (vd. một bản rẻ/nhanh hơn) rồi trỏ biến
-      # này sang deployment đó thay vì dùng chung agent_model_deployment_name.
-      FOUNDRY_JUDGE_DEPLOYMENT: ${{ needs.ensure-infra.outputs.agent_model_deployment_name }}
-      AZURE_SEARCH_ENDPOINT: https://${{ needs.ensure-infra.outputs.search_service_name }}.search.windows.net
-    steps:
-      - name: Checkout Source Code
-        uses: actions/checkout@v4
-
-      - name: Azure Login
-        uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: Install Dependencies
-        run: pip install -r requirements.txt
-
-      # Idempotent Index Sync: gọi THẲNG create-index.py — đây là nguồn xác
-      # thực (source of truth) duy nhất của schema, tự xoá/tạo lại index
-      # sạch mỗi lần chạy. Không dùng file JSON schema rời (infra/
-      # search_index_schema.json) vì file đó không tồn tại và sẽ dễ lệch
-      # với schema thật trong create-index.py theo thời gian.
-      - name: Create or Update Azure AI Search Index (Idempotent)
-        run: python src/create-index.py
-
-      # Đăng ký / nâng version Agent bằng chính src/agent/core.py — không
-      # còn đoạn python -c gọi from_connection_string đã bị SDK loại bỏ.
-      - name: Sync Agent Definition (Prompt Agent) lên Foundry
+      - name: Discover ACR in Resource Group
+        shell: bash
         run: |
-          python -c "
-          from src.agent.core import FoundryRagAgent
+          set -euo pipefail
+          ACR_NAME="$(az acr list \
+            --resource-group "$RESOURCE_GROUP" \
+            --query "[?tags.RagRole=='search' || tags.RagRole=='source'].name | [0]" \
+            -o tsv)"
+          if [[ -z "$ACR_NAME" ]]; then
+            ACR_NAME="$(az acr list --resource-group "$RESOURCE_GROUP" --query '[0].name' -o tsv)"
+          fi
+          [[ -n "$ACR_NAME" ]] || {
+            echo "::error::No ACR found in $RESOURCE_GROUP. Run infra workflow first."
+            exit 1
+          }
+          echo "ACR_NAME=$ACR_NAME" >> "$GITHUB_ENV"
+          echo "ACR=$ACR_NAME"
 
-          agent = FoundryRagAgent()
-          agent.create_or_update()
-          "
+      - name: Login to Azure Container Registry
+        run: az acr login --name "$ACR_NAME"
 
-      # Quality Gate: Chạy đánh giá định lượng bằng azure-ai-evaluation.
-      # Toàn bộ biến FOUNDRY_PROJECT_ENDPOINT / FOUNDRY_AGENT_NAME /
-      # FOUNDRY_JUDGE_DEPLOYMENT / GOLDEN_DATASET đã được set ở trên —
-      # run_eval.py sẽ tự exit 1 nếu bất kỳ threshold nào trong
-      # evals/threshold.json không đạt.
-      - name: Run Automated Evaluation Quality Gate
-        run: python evals/run_eval.py
-
-      # Smoke Test — gọi Agent THẬT qua 1 câu hỏi mẫu, fail job nếu câu trả
-      # lời rỗng hoặc bị guardrails chặn (khác bản cũ chỉ print() cố định,
-      # không bao giờ fail).
-      - name: Smoke Test Agent Execution
+      - name: Build & Push Docker Image
+        shell: bash
         run: |
-          python -c "
-          import sys
-          from src.agent.core import FoundryRagAgent
+          set -euo pipefail
+          IMAGE_URI="${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${IMAGE_TAG}"
+          echo "Target Image URI: $IMAGE_URI"
 
-          agent = FoundryRagAgent()
-          result = agent.ask('RBAC là gì? Sự khác nhau giữa Control Plane và Data Plane?')
+          sed -i "s|image: .*|image: $IMAGE_URI|g" azure/deployment.yml
 
-          if not result['answer'].strip():
-              print('::error::Agent trả về câu trả lời rỗng.')
-              sys.exit(1)
+          if az acr repository show-tags \
+            --name "$ACR_NAME" \
+            --repository "$IMAGE_NAME" \
+            --query "[?@=='${IMAGE_TAG}']" \
+            -o tsv 2>/dev/null | grep -q .; then
+            echo "Image tag already exists; skipping build/push."
+          else
+            docker build -t "$IMAGE_URI" .
+            docker push "$IMAGE_URI"
+          fi
 
-          if 'guardrails' in result['answer'].lower():
-              print('::error::Smoke test bị chặn bởi Content Safety guardrails.')
-              sys.exit(1)
+      - name: Register Profile Data Asset (idempotent)
+        shell: bash
+        run: |
+          set -euo pipefail
+          DATA_NAME="$(grep '^name:' azure/profile_data.yml | awk '{print $2}')"
+          DATA_VERSION="$(grep '^version:' azure/profile_data.yml | awk '{print $2}')"
+          if az ml data show --name "$DATA_NAME" --version "$DATA_VERSION" >/dev/null 2>&1; then
+            echo "Data asset $DATA_NAME v$DATA_VERSION already exists; skipping."
+          else
+            az ml data create -f azure/profile_data.yml
+          fi
 
-          print('Agent phản hồi thành công, vượt qua Smoke Test:')
-          print(result['answer'][:300])
-          "
+      - name: Register Knowledge Base Vector DB Asset
+        run: az ml data create -f azure/knowledge_db.yml
+
+      - name: Register Qwen GGUF Model
+        shell: bash
+        run: |
+          set -euo pipefail
+          MODEL_NAME="$(grep '^name:' azure/model.yml | awk '{print $2}')"
+          MODEL_VERSION="$(grep '^version:' azure/model.yml | awk '{print $2}')"
+
+          if [[ -n "$MODEL_VERSION" ]] && az ml model show --name "$MODEL_NAME" --version "$MODEL_VERSION" >/dev/null 2>&1; then
+            echo "Model $MODEL_NAME v$MODEL_VERSION already exists; skipping registration."
+          else
+            az ml model create -f azure/model.yml
+          fi
+
+      - name: Create or Update Online Endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          if az ml online-endpoint show --name "$ENDPOINT_NAME" >/dev/null 2>&1; then
+            echo "Endpoint exists; updating endpoint configuration."
+            az ml online-endpoint update --name "$ENDPOINT_NAME" -f azure/endpoint.yml
+          else
+            echo "Creating endpoint."
+            az ml online-endpoint create --name "$ENDPOINT_NAME" -f azure/endpoint.yml
+          fi
+
+      - name: Create or Update Online Deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          if az ml online-deployment show \
+            --name "$DEPLOYMENT_NAME" \
+            --endpoint-name "$ENDPOINT_NAME" >/dev/null 2>&1; then
+            az ml online-deployment update \
+              --name "$DEPLOYMENT_NAME" \
+              --endpoint-name "$ENDPOINT_NAME" \
+              -f azure/deployment.yml
+          else
+            az ml online-deployment create \
+              --name "$DEPLOYMENT_NAME" \
+              --endpoint-name "$ENDPOINT_NAME" \
+              -f azure/deployment.yml
+          fi
+
+      - name: Route Traffic to Deployment
+        run: |
+          az ml online-endpoint update \
+            --name "$ENDPOINT_NAME" \
+            --traffic "$DEPLOYMENT_NAME=100"
+
+      - name: Smoke Test Endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          SCORING_URI="$(az ml online-endpoint show --name "$ENDPOINT_NAME" --query scoring_uri -o tsv)"
+          KEY="$(az ml online-endpoint get-credentials --name "$ENDPOINT_NAME" --query primaryKey -o tsv)"
+          curl --fail --silent --show-error --request POST "$SCORING_URI" \
+            --header "Authorization: Bearer $KEY" \
+            --header 'Content-Type: application/json' \
+            --data '{"messages":[{"role":"user","content":"Xin chào"}],"max_tokens":32}' \
+            >/tmp/smoke-test.json
+          cat /tmp/smoke-test.json

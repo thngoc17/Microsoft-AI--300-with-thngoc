@@ -1,0 +1,62 @@
+name: Provision Infrastructure (Bicep)
+
+on:
+  workflow_dispatch:
+    inputs:
+      location:
+        description: Azure region
+        required: false
+        type: string
+        default: eastasia
+  push:
+    branches: [main]
+    paths:
+      - 'infra/main.bicep'
+      - 'infra/**/*.bicep'
+      - '.github/workflows/infra.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infra-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP || 'digital-twin-rg' }}
+  WORKSPACE: ${{ vars.WORKSPACE || 'qwen-twin-workspace' }}
+  KEY_VAULT_NAME: ${{ vars.KEY_VAULT_NAME || 'qwen-rag-vault' }}
+  LOCATION: ${{ inputs.location || vars.AZURE_LOCATION || 'eastasia' }}
+
+jobs:
+  deploy-infra:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy Bicep
+        uses: azure/arm-deploy@v2
+        with:
+          scope: resourcegroup
+          resourceGroupName: ${{ env.RESOURCE_GROUP }}
+          template: infra/main.bicep
+          deploymentName: ai300-infra-${{ github.run_number }}
+          parameters: >
+            location=${{ env.LOCATION }}
+            workspaceName=${{ env.WORKSPACE }}
+            keyVaultName=${{ env.KEY_VAULT_NAME }}
+
+      - name: Verify Resource Group
+        shell: bash
+        run: |
+          set -euo pipefail
+          az group show \
+            --name "$RESOURCE_GROUP" \
+            --query '{name:name,location:location,provisioningState:properties.provisioningState}' \
+            -o table

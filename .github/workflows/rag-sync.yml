@@ -1,0 +1,203 @@
+name: Sync RAG Corpus and Evaluate
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rag/*.md'
+      - 'rag/**/*.md'
+      - '.github/workflows/rag-sync.yml'
+  workflow_dispatch:
+  workflow_run:
+    workflows: ['Provision Infrastructure (Bicep)']
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rag-sync-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP || 'digital-twin-rg' }}
+  RAG_CONTAINER: ${{ vars.RAG_CONTAINER || 'rag' }}
+  RAG_INDEX: ${{ vars.RAG_INDEX || 'ai300-rag-index' }}
+  RAG_INDEXER: ${{ vars.RAG_INDEXER || 'ai300-rag-indexer' }}
+  SEARCH_API_VERSION: '2026-04-01'
+
+jobs:
+  sync:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Validate RAG Corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          COUNT="$(find rag -type f -name '*.md' | wc -l | tr -d ' ')"
+          [[ "$COUNT" -gt 0 ]] || {
+            echo '::error::No Markdown files under rag/.'
+            exit 1
+          }
+          echo "Markdown documents: $COUNT"
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Discover RAG Storage Account
+        shell: bash
+        run: |
+          set -euo pipefail
+          STORAGE_ACCOUNT="$(az storage account list \
+            --resource-group "$RESOURCE_GROUP" \
+            --query "[?tags.RagRole=='source'].name | [0]" \
+            -o tsv)"
+          [[ -n "$STORAGE_ACCOUNT" ]] || {
+            echo '::error::RAG Storage Account not found; run bootstrap.sh.'
+            exit 1
+          }
+          echo "STORAGE_ACCOUNT=$STORAGE_ACCOUNT" >> "$GITHUB_ENV"
+
+      - name: Discover Azure AI Search Service
+        shell: bash
+        run: |
+          set -euo pipefail
+          SEARCH_SERVICE="$(az resource list \
+            --resource-group "$RESOURCE_GROUP" \
+            --resource-type Microsoft.Search/searchServices \
+            --query "[?tags.RagRole=='search'].name | [0]" \
+            -o tsv)"
+          [[ -n "$SEARCH_SERVICE" ]] || {
+            echo '::error::RAG Search service not found; run bootstrap.sh.'
+            exit 1
+          }
+          echo "SEARCH_ENDPOINT=https://${SEARCH_SERVICE}.search.windows.net" >> "$GITHUB_ENV"
+
+      - name: Sync Markdown to Blob
+        shell: bash
+        run: |
+          set -euo pipefail
+          az storage blob sync \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container "$RAG_CONTAINER" \
+            --source ./rag \
+            --auth-mode login \
+            --delete-destination true
+
+      - name: Collect Current Search Document Inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOKEN="$(az account get-access-token --resource https://search.azure.com --query accessToken -o tsv)"
+          echo '[]' > .rag-index-documents.json
+          SKIP=0
+          while :; do
+            PAGE="$(curl --fail --silent --show-error --request POST \
+              "${SEARCH_ENDPOINT}/indexes('${RAG_INDEX}')/docs/search?api-version=${SEARCH_API_VERSION}" \
+              --header "Authorization: Bearer $TOKEN" \
+              --header 'Content-Type: application/json' \
+              --data "{\"search\":\"*\",\"select\":\"id,sourcePath\",\"top\":1000,\"skip\":${SKIP}}")"
+            jq -c '.value // []' <<<"$PAGE" > .rag-page.json
+            jq -s '.[0] + .[1]' .rag-index-documents.json .rag-page.json > .rag-index-documents.tmp
+            mv .rag-index-documents.tmp .rag-index-documents.json
+            PAGE_COUNT="$(jq 'length' .rag-page.json)"
+            echo "Fetched $PAGE_COUNT Search rows at skip=$SKIP"
+            [[ "$PAGE_COUNT" -lt 1000 ]] && break
+            SKIP=$((SKIP + PAGE_COUNT))
+          done
+
+      - name: Delete Documents Removed from RAG Corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOKEN="$(az account get-access-token --resource https://search.azure.com --query accessToken -o tsv)"
+          az storage blob list \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$RAG_CONTAINER" \
+            --auth-mode login \
+            --query '[].name' \
+            -o tsv > .expected-rag-blobs.txt
+
+          python3 -c 'import json,pathlib,sys,urllib.parse; expected=set(pathlib.Path(".expected-rag-blobs.txt").read_text().splitlines()); rows=json.loads(pathlib.Path(".rag-index-documents.json").read_text()); container=sys.argv[1]; deletes=[]; [deletes.append({"@search.action":"delete","id":r["id"]}) for r in rows if urllib.parse.unquote(urllib.parse.urlparse(str(r.get("sourcePath", ""))).path).lstrip("/").split(f"/{container}/",1)[-1] not in expected]; pathlib.Path(".rag-deletions.json").write_text(json.dumps(deletes,ensure_ascii=False)); print(f"Stale Search documents: {len(deletes)}")' "$RAG_CONTAINER"
+
+          COUNT="$(jq 'length' .rag-deletions.json)"
+          if [[ "$COUNT" -eq 0 ]]; then
+            echo "No stale Search documents."
+            exit 0
+          fi
+
+          jq -c '. as $all | range(0; length; 500) as $i | $all[$i:$i+500]' .rag-deletions.json > .rag-delete-batches.jsonl
+          BATCH_NO=0
+          while IFS= read -r BATCH_JSON; do
+            BATCH_NO=$((BATCH_NO + 1))
+            PAYLOAD="$(jq -c '{value:.}' <<<"$BATCH_JSON")"
+            curl --fail --silent --show-error --request POST \
+              "${SEARCH_ENDPOINT}/indexes('${RAG_INDEX}')/docs/index?api-version=${SEARCH_API_VERSION}" \
+              --header "Authorization: Bearer $TOKEN" \
+              --header 'Content-Type: application/json' \
+              --data "$PAYLOAD" >/dev/null
+            echo "Deleted stale Search batch $BATCH_NO"
+          done < .rag-delete-batches.jsonl
+
+      - name: Run Search Indexer
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOKEN="$(az account get-access-token --resource https://search.azure.com --query accessToken -o tsv)"
+          curl --fail --silent --show-error --request POST \
+            "${SEARCH_ENDPOINT}/indexers('${RAG_INDEXER}')/search.run?api-version=${SEARCH_API_VERSION}" \
+            --header "Authorization: Bearer $TOKEN" \
+            --header 'Content-Length: 0' >/dev/null
+
+      - name: Wait for Indexer Success
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOKEN="$(az account get-access-token --resource https://search.azure.com --query accessToken -o tsv)"
+          for attempt in $(seq 1 60); do
+            STATUS_JSON="$(curl --fail --silent --show-error \
+              "${SEARCH_ENDPOINT}/indexers('${RAG_INDEXER}')/search.status?api-version=${SEARCH_API_VERSION}" \
+              --header "Authorization: Bearer $TOKEN")"
+            STATUS="$(jq -r '.lastResult.status // "unknown"' <<<"$STATUS_JSON")"
+            echo "Indexer status=$STATUS (attempt $attempt/60)"
+            case "$STATUS" in
+              success) exit 0 ;;
+              transientFailure|failure|reset)
+                echo "$STATUS_JSON"
+                exit 1
+                ;;
+              *) sleep 10 ;;
+            esac
+          done
+          echo '::error::Timed out waiting for Search indexer.'
+          exit 1
+
+      - name: Verify Non-Empty Search Index
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOKEN="$(az account get-access-token --resource https://search.azure.com --query accessToken -o tsv)"
+          RESULT="$(curl --fail --silent --show-error --request POST \
+            "${SEARCH_ENDPOINT}/indexes('${RAG_INDEX}')/docs/search?api-version=${SEARCH_API_VERSION}" \
+            --header "Authorization: Bearer $TOKEN" \
+            --header 'Content-Type: application/json' \
+            --data '{"search":"*","count":true,"top":0}')"
+          COUNT="$(jq -r '.["@odata.count"] // 0' <<<"$RESULT")"
+          echo "Indexed documents: $COUNT"
+          [[ "$COUNT" -gt 0 ]] || {
+            echo '::error::Search index is empty after sync.'
+            exit 1
+          }
+
+  evaluate:
+    needs: sync
+    uses: ./.github/workflows/eval.yml
+    secrets: inherit
+    with:
+      agent_version: ${{ vars.FOUNDRY_AGENT_VERSION || '' }}
